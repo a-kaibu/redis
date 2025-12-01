@@ -1,6 +1,8 @@
 # Redis Sorted Set Timestamp Extension
 
-Redis Sorted Setにタイムスタンプ機能を追加したフォーク版です。同じスコアを持つ要素間でタイムスタンプによるtie-breakが可能になります。
+Redis Sorted Setにタイムスタンプ機能を追加したフォーク版です。同じスコアを持つ要素間でタイムスタンプによるtie-breakが可能になります。  
+
+差分 <https://github.com/a-kaibu/redis/compare/8.4.0...main>  
 
 ## 機能概要
 
