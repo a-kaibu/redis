@@ -1599,6 +1599,7 @@ struct sharedObjectsStruct {
 typedef struct zskiplistNode {
     sds ele;
     double score;
+    long long timestamp;  /* Milliseconds since Unix epoch for tie-breaking */
     struct zskiplistNode *backward;
     struct zskiplistLevel {
         struct zskiplistNode *forward;
@@ -3414,8 +3415,11 @@ typedef struct {
 zskiplist *zslCreate(void);
 void zslFree(zskiplist *zsl);
 size_t zslAllocSize(const zskiplist *zsl);
-zskiplistNode *zslInsert(zskiplist *zsl, double score, sds ele);
-unsigned char *zzlInsert(unsigned char *zl, sds ele, double score);
+zskiplistNode *zslInsert(zskiplist *zsl, double score, long long timestamp, sds ele);
+zskiplistNode *zslFind(zskiplist *zsl, double score, sds ele);
+zskiplistNode *zslUpdateScore(zskiplist *zsl, double curscore, long long curtimestamp, sds ele, double newscore, long long newtimestamp);
+unsigned char *zzlInsert(unsigned char *zl, sds ele, double score, long long timestamp);
+long long zzlGetTimestamp(unsigned char *zl, unsigned char *sptr);
 int zslDelete(zskiplist *zsl, double score, sds ele, zskiplistNode **node);
 zskiplistNode *zslNthInRange(zskiplist *zsl, zrangespec *range, long n);
 double zzlGetScore(unsigned char *sptr);
@@ -3429,7 +3433,7 @@ void zsetConvert(robj *zobj, int encoding);
 void zsetConvertToListpackIfNeeded(robj *zobj, size_t maxelelen, size_t totelelen);
 int zsetScore(robj *zobj, sds member, double *score);
 unsigned long zslGetRank(zskiplist *zsl, double score, sds o);
-int zsetAdd(robj *zobj, double score, sds ele, int in_flags, int *out_flags, double *newscore);
+int zsetAdd(robj *zobj, double score, long long timestamp, sds ele, int in_flags, int *out_flags, double *newscore);
 long zsetRank(robj *zobj, sds ele, int reverse, double *score);
 int zsetDel(robj *zobj, sds ele);
 robj *zsetDup(robj *o);

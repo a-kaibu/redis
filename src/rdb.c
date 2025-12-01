@@ -2160,7 +2160,9 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
             if (sdslen(sdsele) > maxelelen) maxelelen = sdslen(sdsele);
             totelelen += sdslen(sdsele);
 
-            znode = zslInsert(zs->zsl,score,sdsele);
+            /* TODO: Load timestamp from RDB when new format is implemented.
+             * For backward compatibility with old RDB format, use 0 as default. */
+            znode = zslInsert(zs->zsl,score,0,sdsele);
             if (dictAdd(zs->dict,sdsele,&znode->score) != DICT_OK) {
                 rdbReportCorruptRDB("Duplicate zset fields detected");
                 decrRefCount(o);

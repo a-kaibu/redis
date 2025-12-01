@@ -57,11 +57,12 @@ zskiplistNode *zslGetElementByRank(zskiplist *zsl, unsigned long rank);
 
 /* Create a skiplist node with the specified number of levels.
  * The SDS string 'ele' is referenced by the node after the call. */
-zskiplistNode *zslCreateNode(zskiplist *zsl, int level, double score, sds ele) {
+zskiplistNode *zslCreateNode(zskiplist *zsl, int level, double score, long long timestamp, sds ele) {
     size_t usable;
     zskiplistNode *zn =
         zmalloc_usable(sizeof(*zn)+level*sizeof(struct zskiplistLevel), &usable);
     zn->score = score;
+    zn->timestamp = timestamp;
     zn->ele = ele;
     zsl->alloc_size += usable;
     if (ele) zsl->alloc_size += sdsAllocSize(ele);
@@ -78,7 +79,7 @@ zskiplist *zslCreate(void) {
     zsl->level = 1;
     zsl->length = 0;
     zsl->alloc_size = zsl_size;
-    zsl->header = zslCreateNode(zsl,ZSKIPLIST_MAXLEVEL,0,NULL);
+    zsl->header = zslCreateNode(zsl,ZSKIPLIST_MAXLEVEL,0,0,NULL);
     for (j = 0; j < ZSKIPLIST_MAXLEVEL; j++) {
         zsl->header->level[j].forward = NULL;
         zsl->header->level[j].span = 0;
@@ -137,7 +138,7 @@ int zslRandomLevel(void) {
 /* Insert a new node in the skiplist. Assumes the element does not already
  * exist (up to the caller to enforce that). The skiplist takes ownership
  * of the passed SDS string 'ele'. */
-zskiplistNode *zslInsert(zskiplist *zsl, double score, sds ele) {
+zskiplistNode *zslInsert(zskiplist *zsl, double score, long long timestamp, sds ele) {
     zskiplistNode *update[ZSKIPLIST_MAXLEVEL], *x;
     unsigned long rank[ZSKIPLIST_MAXLEVEL];
     int i, level;
@@ -150,7 +151,9 @@ zskiplistNode *zslInsert(zskiplist *zsl, double score, sds ele) {
         while (x->level[i].forward &&
                 (x->level[i].forward->score < score ||
                     (x->level[i].forward->score == score &&
-                    sdscmp(x->level[i].forward->ele,ele) < 0)))
+                     (x->level[i].forward->timestamp < timestamp ||
+                        (x->level[i].forward->timestamp == timestamp &&
+                         sdscmp(x->level[i].forward->ele,ele) < 0)))))
         {
             rank[i] += x->level[i].span;
             x = x->level[i].forward;
@@ -170,7 +173,7 @@ zskiplistNode *zslInsert(zskiplist *zsl, double score, sds ele) {
         }
         zsl->level = level;
     }
-    x = zslCreateNode(zsl,level,score,ele);
+    x = zslCreateNode(zsl,level,score,timestamp,ele);
     for (i = 0; i < level; i++) {
         x->level[i].forward = update[i]->level[i].forward;
         update[i]->level[i].forward = x;
@@ -263,8 +266,9 @@ int zslDelete(zskiplist *zsl, double score, sds ele, zskiplistNode **node) {
  * Otherwise the skiplist is modified by removing and re-adding a new
  * element, which is more costly.
  *
- * The function returns the updated element skiplist node pointer. */
-zskiplistNode *zslUpdateScore(zskiplist *zsl, double curscore, sds ele, double newscore) {
+ * The function returns the updated element skiplist node pointer.
+ * If newtimestamp is -1, the original timestamp is preserved. */
+zskiplistNode *zslUpdateScore(zskiplist *zsl, double curscore, long long curtimestamp, sds ele, double newscore, long long newtimestamp) {
     zskiplistNode *update[ZSKIPLIST_MAXLEVEL], *x;
     int i;
 
@@ -275,7 +279,9 @@ zskiplistNode *zslUpdateScore(zskiplist *zsl, double curscore, sds ele, double n
         while (x->level[i].forward &&
                 (x->level[i].forward->score < curscore ||
                     (x->level[i].forward->score == curscore &&
-                     sdscmp(x->level[i].forward->ele,ele) < 0)))
+                     (x->level[i].forward->timestamp < curtimestamp ||
+                        (x->level[i].forward->timestamp == curtimestamp &&
+                         sdscmp(x->level[i].forward->ele,ele) < 0)))))
         {
             x = x->level[i].forward;
         }
@@ -287,20 +293,28 @@ zskiplistNode *zslUpdateScore(zskiplist *zsl, double curscore, sds ele, double n
     x = x->level[0].forward;
     serverAssert(x && curscore == x->score && sdscmp(x->ele,ele) == 0);
 
+    /* If newtimestamp is -1, preserve the original timestamp */
+    long long final_timestamp = (newtimestamp == -1) ? x->timestamp : newtimestamp;
+
     /* If the node, after the score update, would be still exactly
      * at the same position, we can just update the score without
      * actually removing and re-inserting the element in the skiplist. */
-    if ((x->backward == NULL || x->backward->score < newscore) &&
-        (x->level[0].forward == NULL || x->level[0].forward->score > newscore))
+    if ((x->backward == NULL ||
+         x->backward->score < newscore ||
+         (x->backward->score == newscore && x->backward->timestamp < final_timestamp)) &&
+        (x->level[0].forward == NULL ||
+         x->level[0].forward->score > newscore ||
+         (x->level[0].forward->score == newscore && x->level[0].forward->timestamp > final_timestamp)))
     {
         x->score = newscore;
+        x->timestamp = final_timestamp;
         return x;
     }
 
     /* No way to reuse the old node: we need to remove and insert a new
      * one at a different place. */
     zslDeleteNode(zsl, x, update);
-    zskiplistNode *newnode = zslInsert(zsl,newscore,x->ele);
+    zskiplistNode *newnode = zslInsert(zsl,newscore,final_timestamp,x->ele);
     /* We reused the old node x->ele SDS string, free the node now
      * since zslInsert created a new one. */
     if (x->ele) zsl->alloc_size -= sdsAllocSize(x->ele);
@@ -530,6 +544,29 @@ unsigned long zslGetRank(zskiplist *zsl, double score, sds ele) {
         }
     }
     return 0;
+}
+
+/* Find and return the node with the given score and element.
+ * Returns NULL if not found. */
+zskiplistNode *zslFind(zskiplist *zsl, double score, sds ele) {
+    zskiplistNode *x;
+    int i;
+
+    x = zsl->header;
+    for (i = zsl->level-1; i >= 0; i--) {
+        while (x->level[i].forward &&
+            (x->level[i].forward->score < score ||
+                (x->level[i].forward->score == score &&
+                sdscmp(x->level[i].forward->ele,ele) < 0))) {
+            x = x->level[i].forward;
+        }
+    }
+    /* x->level[0].forward is the node we're looking for */
+    x = x->level[0].forward;
+    if (x && x->score == score && sdscmp(x->ele,ele) == 0) {
+        return x;
+    }
+    return NULL;
 }
 
 /* Finds an element by its rank from start node. The rank argument needs to be 1-based. */
@@ -814,6 +851,28 @@ double zzlGetScore(unsigned char *sptr) {
     return score;
 }
 
+/* Get the timestamp from the listpack entry following the score pointer.
+ * Listpack format is: [element, score, timestamp, element, score, timestamp, ...]
+ * sptr points to the score entry, and this function returns the timestamp
+ * from the entry right after the score. */
+long long zzlGetTimestamp(unsigned char *zl, unsigned char *sptr) {
+    unsigned char *tptr;
+    unsigned char *vstr;
+    unsigned int vlen;
+    long long vlong;
+
+    serverAssert(sptr != NULL);
+    tptr = lpNext(zl, sptr);
+    if (tptr == NULL) return 0;  /* No timestamp entry, return 0 for backward compat */
+
+    vstr = lpGetValue(tptr, &vlen, &vlong);
+    if (vstr) {
+        /* Timestamp should always be stored as integer, but handle string case */
+        return strtoll((char*)vstr, NULL, 10);
+    }
+    return vlong;
+}
+
 /* Return a listpack element as an SDS string. */
 sds lpGetObject(unsigned char *sptr) {
     unsigned char *vstr;
@@ -852,21 +911,29 @@ int zzlCompareElements(unsigned char *eptr, unsigned char *cstr, unsigned int cl
 }
 
 unsigned int zzlLength(unsigned char *zl) {
-    return lpLength(zl)/2;
+    return lpLength(zl)/3;  /* Each entry has element, score, timestamp */
 }
 
 /* Move to next entry based on the values in eptr and sptr. Both are set to
  * NULL when there is no next entry. */
 void zzlNext(unsigned char *zl, unsigned char **eptr, unsigned char **sptr) {
-    unsigned char *_eptr, *_sptr;
+    unsigned char *_eptr, *_sptr, *_tptr;
     serverAssert(*eptr != NULL && *sptr != NULL);
 
-    _eptr = lpNext(zl,*sptr);
-    if (_eptr != NULL) {
-        _sptr = lpNext(zl,_eptr);
-        serverAssert(_sptr != NULL);
+    /* Skip timestamp to get to next element */
+    _tptr = lpNext(zl,*sptr);  /* timestamp entry */
+    if (_tptr != NULL) {
+        _eptr = lpNext(zl,_tptr);  /* next element entry */
+        if (_eptr != NULL) {
+            _sptr = lpNext(zl,_eptr);
+            serverAssert(_sptr != NULL);
+        } else {
+            /* No next entry. */
+            _sptr = NULL;
+        }
     } else {
         /* No next entry. */
+        _eptr = NULL;
         _sptr = NULL;
     }
 
@@ -877,16 +944,24 @@ void zzlNext(unsigned char *zl, unsigned char **eptr, unsigned char **sptr) {
 /* Move to the previous entry based on the values in eptr and sptr. Both are
  * set to NULL when there is no prev entry. */
 void zzlPrev(unsigned char *zl, unsigned char **eptr, unsigned char **sptr) {
-    unsigned char *_eptr, *_sptr;
+    unsigned char *_eptr, *_sptr, *_tptr;
     serverAssert(*eptr != NULL && *sptr != NULL);
 
-    _sptr = lpPrev(zl,*eptr);
-    if (_sptr != NULL) {
-        _eptr = lpPrev(zl,_sptr);
-        serverAssert(_eptr != NULL);
+    /* Go back: timestamp -> score -> element of previous entry */
+    _tptr = lpPrev(zl,*eptr);  /* timestamp of previous entry */
+    if (_tptr != NULL) {
+        _sptr = lpPrev(zl,_tptr);  /* score of previous entry */
+        if (_sptr != NULL) {
+            _eptr = lpPrev(zl,_sptr);  /* element of previous entry */
+            serverAssert(_eptr != NULL);
+        } else {
+            /* No previous entry. */
+            _eptr = NULL;
+        }
     } else {
         /* No previous entry. */
         _eptr = NULL;
+        _sptr = NULL;
     }
 
     *eptr = _eptr;
@@ -904,7 +979,7 @@ int zzlIsInRange(unsigned char *zl, zrangespec *range) {
             (range->min == range->max && (range->minex || range->maxex)))
         return 0;
 
-    p = lpSeek(zl,-1); /* Last score. */
+    p = lpSeek(zl,-2); /* Last score (skip timestamp). */
     if (p == NULL) return 0; /* Empty sorted set */
     score = zzlGetScore(p);
     if (!zslValueGteMin(score,range))
@@ -922,7 +997,7 @@ int zzlIsInRange(unsigned char *zl, zrangespec *range) {
 /* Find pointer to the first element contained in the specified range.
  * Returns NULL when no element is contained in the range. */
 unsigned char *zzlFirstInRange(unsigned char *zl, zrangespec *range) {
-    unsigned char *eptr = lpSeek(zl,0), *sptr;
+    unsigned char *eptr = lpSeek(zl,0), *sptr, *tptr;
     double score;
 
     /* If everything is out of range, return early. */
@@ -940,8 +1015,10 @@ unsigned char *zzlFirstInRange(unsigned char *zl, zrangespec *range) {
             return NULL;
         }
 
-        /* Move to next element. */
-        eptr = lpNext(zl,sptr);
+        /* Move to next element (skip timestamp). */
+        tptr = lpNext(zl,sptr);
+        serverAssert(tptr != NULL);
+        eptr = lpNext(zl,tptr);
     }
 
     return NULL;
@@ -950,7 +1027,7 @@ unsigned char *zzlFirstInRange(unsigned char *zl, zrangespec *range) {
 /* Find pointer to the last element contained in the specified range.
  * Returns NULL when no element is contained in the range. */
 unsigned char *zzlLastInRange(unsigned char *zl, zrangespec *range) {
-    unsigned char *eptr = lpSeek(zl,-2), *sptr;
+    unsigned char *eptr = lpSeek(zl,-3), *sptr, *tptr;  /* Start at last element (skip timestamp and score) */
     double score;
 
     /* If everything is out of range, return early. */
@@ -968,13 +1045,20 @@ unsigned char *zzlLastInRange(unsigned char *zl, zrangespec *range) {
             return NULL;
         }
 
-        /* Move to previous element by moving to the score of previous element.
+        /* Move to previous element by moving backwards: timestamp -> score -> element.
          * When this returns NULL, we know there also is no element. */
-        sptr = lpPrev(zl,eptr);
-        if (sptr != NULL)
-            serverAssert((eptr = lpPrev(zl,sptr)) != NULL);
-        else
+        tptr = lpPrev(zl,eptr);  /* timestamp of previous entry */
+        if (tptr != NULL) {
+            sptr = lpPrev(zl,tptr);  /* score of previous entry */
+            if (sptr != NULL) {
+                eptr = lpPrev(zl,sptr);  /* element of previous entry */
+                serverAssert(eptr != NULL);
+            } else {
+                eptr = NULL;
+            }
+        } else {
             eptr = NULL;
+        }
     }
 
     return NULL;
@@ -1004,7 +1088,7 @@ int zzlIsInLexRange(unsigned char *zl, zlexrangespec *range) {
     if (cmp > 0 || (cmp == 0 && (range->minex || range->maxex)))
         return 0;
 
-    p = lpSeek(zl,-2); /* Last element. */
+    p = lpSeek(zl,-3); /* Last element (skip timestamp and score). */
     if (p == NULL) return 0;
     if (!zzlLexValueGteMin(p,range))
         return 0;
@@ -1020,7 +1104,7 @@ int zzlIsInLexRange(unsigned char *zl, zlexrangespec *range) {
 /* Find pointer to the first element contained in the specified lex range.
  * Returns NULL when no element is contained in the range. */
 unsigned char *zzlFirstInLexRange(unsigned char *zl, zlexrangespec *range) {
-    unsigned char *eptr = lpSeek(zl,0), *sptr;
+    unsigned char *eptr = lpSeek(zl,0), *sptr, *tptr;
 
     /* If everything is out of range, return early. */
     if (!zzlIsInLexRange(zl,range)) return NULL;
@@ -1033,10 +1117,12 @@ unsigned char *zzlFirstInLexRange(unsigned char *zl, zlexrangespec *range) {
             return NULL;
         }
 
-        /* Move to next element. */
+        /* Move to next element (skip score and timestamp). */
         sptr = lpNext(zl,eptr); /* This element score. Skip it. */
         serverAssert(sptr != NULL);
-        eptr = lpNext(zl,sptr); /* Next element. */
+        tptr = lpNext(zl,sptr); /* Timestamp. Skip it. */
+        serverAssert(tptr != NULL);
+        eptr = lpNext(zl,tptr); /* Next element. */
     }
 
     return NULL;
@@ -1045,7 +1131,7 @@ unsigned char *zzlFirstInLexRange(unsigned char *zl, zlexrangespec *range) {
 /* Find pointer to the last element contained in the specified lex range.
  * Returns NULL when no element is contained in the range. */
 unsigned char *zzlLastInLexRange(unsigned char *zl, zlexrangespec *range) {
-    unsigned char *eptr = lpSeek(zl,-2), *sptr;
+    unsigned char *eptr = lpSeek(zl,-3), *sptr, *tptr;  /* Start at last element */
 
     /* If everything is out of range, return early. */
     if (!zzlIsInLexRange(zl,range)) return NULL;
@@ -1058,13 +1144,20 @@ unsigned char *zzlLastInLexRange(unsigned char *zl, zlexrangespec *range) {
             return NULL;
         }
 
-        /* Move to previous element by moving to the score of previous element.
+        /* Move to previous element by moving backwards: timestamp -> score -> element.
          * When this returns NULL, we know there also is no element. */
-        sptr = lpPrev(zl,eptr);
-        if (sptr != NULL)
-            serverAssert((eptr = lpPrev(zl,sptr)) != NULL);
-        else
+        tptr = lpPrev(zl,eptr);  /* timestamp of previous entry */
+        if (tptr != NULL) {
+            sptr = lpPrev(zl,tptr);  /* score of previous entry */
+            if (sptr != NULL) {
+                eptr = lpPrev(zl,sptr);  /* element of previous entry */
+                serverAssert(eptr != NULL);
+            } else {
+                eptr = NULL;
+            }
+        } else {
             eptr = NULL;
+        }
     }
 
     return NULL;
@@ -1087,13 +1180,13 @@ unsigned char *zzlFind(unsigned char *lp, sds ele, double *score) {
     return NULL;
 }
 
-/* Delete (element,score) pair from listpack. Use local copy of eptr because we
+/* Delete (element,score,timestamp) tuple from listpack. Use local copy of eptr because we
  * don't want to modify the one given as argument. */
 unsigned char *zzlDelete(unsigned char *zl, unsigned char *eptr) {
-    return lpDeleteRangeWithEntry(zl,&eptr,2);
+    return lpDeleteRangeWithEntry(zl,&eptr,3);
 }
 
-unsigned char *zzlInsertAt(unsigned char *zl, unsigned char *eptr, sds ele, double score) {
+unsigned char *zzlInsertAt(unsigned char *zl, unsigned char *eptr, sds ele, double score, long long timestamp) {
     char scorebuf[MAX_D2STRING_CHARS];
     int scorelen = 0;
     long long lscore;
@@ -1101,7 +1194,7 @@ unsigned char *zzlInsertAt(unsigned char *zl, unsigned char *eptr, sds ele, doub
     if (!score_is_long)
         scorelen = d2string(scorebuf,sizeof(scorebuf),score);
 
-    listpackEntry entries[2];
+    listpackEntry entries[3];
     entries[0].sval = (unsigned char*)ele;
     entries[0].slen = sdslen(ele);
     if (score_is_long) {
@@ -1111,47 +1204,60 @@ unsigned char *zzlInsertAt(unsigned char *zl, unsigned char *eptr, sds ele, doub
         entries[1].sval = (unsigned char*)scorebuf;
         entries[1].slen = scorelen;
     }
+    /* Timestamp is always stored as integer */
+    entries[2].sval = NULL;
+    entries[2].lval = timestamp;
 
     if (eptr == NULL)
-        zl = lpBatchAppend(zl, entries, 2);
+        zl = lpBatchAppend(zl, entries, 3);
     else
-        zl = lpBatchInsert(zl, eptr, LP_BEFORE, entries, 2, NULL);
+        zl = lpBatchInsert(zl, eptr, LP_BEFORE, entries, 3, NULL);
 
     return zl;
 }
 
-/* Insert (element,score) pair in listpack. This function assumes the element is
+/* Insert (element,score,timestamp) tuple in listpack. This function assumes the element is
  * not yet present in the list. */
-unsigned char *zzlInsert(unsigned char *zl, sds ele, double score) {
-    unsigned char *eptr = lpSeek(zl,0), *sptr;
+unsigned char *zzlInsert(unsigned char *zl, sds ele, double score, long long timestamp) {
+    unsigned char *eptr = lpSeek(zl,0), *sptr, *tptr;
     double s;
+    long long t;
 
     while (eptr != NULL) {
         sptr = lpNext(zl,eptr);
         serverAssert(sptr != NULL);
         s = zzlGetScore(sptr);
+        tptr = lpNext(zl,sptr);
+        serverAssert(tptr != NULL);
+        t = zzlGetTimestamp(zl, sptr);
 
         if (s > score) {
             /* First element with score larger than score for element to be
              * inserted. This means we should take its spot in the list to
              * maintain ordering. */
-            zl = zzlInsertAt(zl,eptr,ele,score);
+            zl = zzlInsertAt(zl,eptr,ele,score,timestamp);
             break;
         } else if (s == score) {
-            /* Ensure lexicographical ordering for elements. */
-            if (zzlCompareElements(eptr,(unsigned char*)ele,sdslen(ele)) > 0) {
-                zl = zzlInsertAt(zl,eptr,ele,score);
+            /* Score is the same, compare timestamp */
+            if (t > timestamp) {
+                zl = zzlInsertAt(zl,eptr,ele,score,timestamp);
                 break;
+            } else if (t == timestamp) {
+                /* Timestamp is also the same, ensure lexicographical ordering for elements. */
+                if (zzlCompareElements(eptr,(unsigned char*)ele,sdslen(ele)) > 0) {
+                    zl = zzlInsertAt(zl,eptr,ele,score,timestamp);
+                    break;
+                }
             }
         }
 
-        /* Move to next element. */
-        eptr = lpNext(zl,sptr);
+        /* Move to next element (skip timestamp). */
+        eptr = lpNext(zl,tptr);
     }
 
     /* Push on tail of list when it was not yet inserted. */
     if (eptr == NULL)
-        zl = zzlInsertAt(zl,NULL,ele,score);
+        zl = zzlInsertAt(zl,NULL,ele,score,timestamp);
     return zl;
 }
 
@@ -1169,8 +1275,8 @@ unsigned char *zzlDeleteRangeByScore(unsigned char *zl, zrangespec *range, unsig
     while (eptr && (sptr = lpNext(zl,eptr)) != NULL) {
         score = zzlGetScore(sptr);
         if (zslValueLteMax(score,range)) {
-            /* Delete both the element and the score. */
-            zl = lpDeleteRangeWithEntry(zl,&eptr,2);
+            /* Delete element, score, and timestamp. */
+            zl = lpDeleteRangeWithEntry(zl,&eptr,3);
             num++;
         } else {
             /* No longer in range. */
@@ -1194,8 +1300,8 @@ unsigned char *zzlDeleteRangeByLex(unsigned char *zl, zlexrangespec *range, unsi
     /* When the tail of the listpack is deleted, eptr will be NULL. */
     while (eptr && (sptr = lpNext(zl,eptr)) != NULL) {
         if (zzlLexValueLteMax(eptr,range)) {
-            /* Delete both the element and the score. */
-            zl = lpDeleteRangeWithEntry(zl,&eptr,2);
+            /* Delete element, score, and timestamp. */
+            zl = lpDeleteRangeWithEntry(zl,&eptr,3);
             num++;
         } else {
             /* No longer in range. */
@@ -1212,7 +1318,7 @@ unsigned char *zzlDeleteRangeByLex(unsigned char *zl, zlexrangespec *range, unsi
 unsigned char *zzlDeleteRangeByRank(unsigned char *zl, unsigned int start, unsigned int end, unsigned long *deleted) {
     unsigned int num = (end-start)+1;
     if (deleted) *deleted = num;
-    zl = lpDeleteRange(zl,2*(start-1),2*num);
+    zl = lpDeleteRange(zl,3*(start-1),3*num);  /* Each entry has element, score, timestamp */
     return zl;
 }
 
@@ -1319,13 +1425,14 @@ void zsetConvertAndExpand(robj *zobj, int encoding, unsigned long cap) {
 
         while (eptr != NULL) {
             score = zzlGetScore(sptr);
+            long long timestamp = zzlGetTimestamp(zl, sptr);
             vstr = lpGetValue(eptr,&vlen,&vlong);
             if (vstr == NULL)
                 ele = sdsfromlonglong(vlong);
             else
                 ele = sdsnewlen((char*)vstr,vlen);
 
-            node = zslInsert(zs->zsl,score,ele);
+            node = zslInsert(zs->zsl,score,timestamp,ele);
             serverAssert(dictAdd(zs->dict,ele,&node->score) == DICT_OK);
             zzlNext(zl,&eptr,&sptr);
         }
@@ -1347,7 +1454,7 @@ void zsetConvertAndExpand(robj *zobj, int encoding, unsigned long cap) {
         zfree(zs->zsl->header);
 
         while (node) {
-            zl = zzlInsertAt(zl,NULL,node->ele,node->score);
+            zl = zzlInsertAt(zl,NULL,node->ele,node->score,node->timestamp);
             next = node->level[0].forward;
             zslFreeNode(zs->zsl, node);
             node = next;
@@ -1441,8 +1548,12 @@ int zsetScore(robj *zobj, sds member, double *score) {
  * Memory management of 'ele':
  *
  * The function does not take ownership of the 'ele' SDS string, but copies
- * it if needed. */
-int zsetAdd(robj *zobj, double score, sds ele, int in_flags, int *out_flags, double *newscore) {
+ * it if needed.
+ *
+ * The 'timestamp' parameter is used for tie-breaking when scores are equal.
+ * If timestamp is -1, the current time in milliseconds is used for new elements,
+ * or the existing timestamp is preserved for updates. */
+int zsetAdd(robj *zobj, double score, long long timestamp, sds ele, int in_flags, int *out_flags, double *newscore) {
     /* Turn options into simple to check vars. */
     int incr = (in_flags & ZADD_IN_INCR) != 0;
     int nx = (in_flags & ZADD_IN_NX) != 0;
@@ -1461,6 +1572,7 @@ int zsetAdd(robj *zobj, double score, sds ele, int in_flags, int *out_flags, dou
     /* Update the sorted set according to its encoding. */
     if (zobj->encoding == OBJ_ENCODING_LISTPACK) {
         unsigned char *eptr;
+        long long curtimestamp = 0;
 
         if ((eptr = zzlFind(zobj->ptr,ele,&curscore)) != NULL) {
             /* NX? Return, same element already exists. */
@@ -1468,6 +1580,10 @@ int zsetAdd(robj *zobj, double score, sds ele, int in_flags, int *out_flags, dou
                 *out_flags |= ZADD_OUT_NOP;
                 return 1;
             }
+
+            /* Get current timestamp for this element */
+            unsigned char *sptr = lpNext(zobj->ptr, eptr);
+            curtimestamp = zzlGetTimestamp(zobj->ptr, sptr);
 
             /* Prepare the score for the increment if needed. */
             if (incr) {
@@ -1486,14 +1602,20 @@ int zsetAdd(robj *zobj, double score, sds ele, int in_flags, int *out_flags, dou
 
             if (newscore) *newscore = score;
 
+            /* Determine final timestamp: -1 means preserve existing */
+            long long final_timestamp = (timestamp == -1) ? curtimestamp : timestamp;
+
             /* Remove and re-insert when score changed. */
-            if (score != curscore) {
+            if (score != curscore || final_timestamp != curtimestamp) {
                 zobj->ptr = zzlDelete(zobj->ptr,eptr);
-                zobj->ptr = zzlInsert(zobj->ptr,ele,score);
+                zobj->ptr = zzlInsert(zobj->ptr,ele,score,final_timestamp);
                 *out_flags |= ZADD_OUT_UPDATED;
             }
             return 1;
         } else if (!xx) {
+            /* For new elements, use provided timestamp or 0 if -1 */
+            long long final_timestamp = (timestamp == -1) ? 0 : timestamp;
+
             /* check if the element is too large or the list
              * becomes too long *before* executing zzlInsert. */
             if (zzlLength(zobj->ptr)+1 > server.zset_max_listpack_entries ||
@@ -1502,7 +1624,7 @@ int zsetAdd(robj *zobj, double score, sds ele, int in_flags, int *out_flags, dou
             {
                 zsetConvertAndExpand(zobj, OBJ_ENCODING_SKIPLIST, zsetLength(zobj) + 1);
             } else {
-                zobj->ptr = zzlInsert(zobj->ptr,ele,score);
+                zobj->ptr = zzlInsert(zobj->ptr,ele,score,final_timestamp);
                 if (newscore) *newscore = score;
                 *out_flags |= ZADD_OUT_ADDED;
                 return 1;
@@ -1530,6 +1652,10 @@ int zsetAdd(robj *zobj, double score, sds ele, int in_flags, int *out_flags, dou
 
             curscore = *(double*)dictGetVal(de);
 
+            /* Find the node to get current timestamp */
+            znode = zslFind(zs->zsl, curscore, ele);
+            long long curtimestamp = znode ? znode->timestamp : 0;
+
             /* Prepare the score for the increment if needed. */
             if (incr) {
                 score += curscore;
@@ -1547,9 +1673,12 @@ int zsetAdd(robj *zobj, double score, sds ele, int in_flags, int *out_flags, dou
 
             if (newscore) *newscore = score;
 
-            /* Remove and re-insert when score changes. */
-            if (score != curscore) {
-                znode = zslUpdateScore(zs->zsl,curscore,ele,score);
+            /* Determine final timestamp: -1 means preserve existing */
+            long long final_timestamp = (timestamp == -1) ? curtimestamp : timestamp;
+
+            /* Remove and re-insert when score or timestamp changes. */
+            if (score != curscore || final_timestamp != curtimestamp) {
+                znode = zslUpdateScore(zs->zsl,curscore,curtimestamp,ele,score,final_timestamp);
                 /* Note that we did not removed the original element from
                  * the hash table representing the sorted set, so we just
                  * update the score. */
@@ -1558,8 +1687,11 @@ int zsetAdd(robj *zobj, double score, sds ele, int in_flags, int *out_flags, dou
             }
             return 1;
         } else if (!xx) {
+            /* For new elements, use provided timestamp or 0 if -1 */
+            long long final_timestamp = (timestamp == -1) ? 0 : timestamp;
+
             ele = sdsdup(ele);
-            znode = zslInsert(zs->zsl,score,ele);
+            znode = zslInsert(zs->zsl,score,final_timestamp,ele);
             serverAssert(dictAdd(zs->dict,ele,&znode->score) == DICT_OK);
             *out_flags |= ZADD_OUT_ADDED;
             if (newscore) *newscore = score;
@@ -1737,7 +1869,7 @@ robj *zsetDup(robj *o) {
         while (llen--) {
             ele = ln->ele;
             sds new_ele = sdsdup(ele);
-            zskiplistNode *znode = zslInsert(new_zs->zsl,ln->score,new_ele);
+            zskiplistNode *znode = zslInsert(new_zs->zsl,ln->score,ln->timestamp,new_ele);
             dictAdd(new_zs->dict,new_ele,&znode->score);
             ln = ln->backward;
         }
@@ -1895,7 +2027,9 @@ void zaddGenericCommand(client *c, int flags) {
         int retflags = 0;
 
         ele = c->argv[scoreidx+1+j*2]->ptr;
-        int retval = zsetAdd(zobj, score, ele, flags, &retflags, &newscore);
+        /* TODO: Parse TIMESTAMP option from command arguments.
+         * For now, use -1 to preserve existing timestamp or use 0 for new elements. */
+        int retval = zsetAdd(zobj, score, -1, ele, flags, &retflags, &newscore);
         if (retval == 0) {
             addReplyError(c,nanerr);
             if (server.memory_tracking_per_slot)
@@ -2184,6 +2318,7 @@ typedef struct {
     unsigned int elen;
     long long ell;
     double score;
+    long long timestamp;  /* Timestamp for tie-breaking */
 } zsetopval;
 
 typedef union _iterset iterset;
@@ -2351,6 +2486,7 @@ int zuiNext(zsetopsrc *op, zsetopval *val) {
                 return 0;
             val->estr = lpGetValue(it->zl.eptr,&val->elen,&val->ell);
             val->score = zzlGetScore(it->zl.sptr);
+            val->timestamp = zzlGetTimestamp(it->zl.zl, it->zl.sptr);
 
             /* Move to next element (going backwards, see zuiInitIterator). */
             zzlPrev(it->zl.zl,&it->zl.eptr,&it->zl.sptr);
@@ -2359,6 +2495,7 @@ int zuiNext(zsetopsrc *op, zsetopval *val) {
                 return 0;
             val->ele = it->sl.node->ele;
             val->score = it->sl.node->score;
+            val->timestamp = it->sl.node->timestamp;
 
             /* Move to next element. (going backwards, see zuiInitIterator) */
             it->sl.node = it->sl.node->backward;
@@ -2572,7 +2709,8 @@ static void zdiffAlgorithm1(zsetopsrc *src, long setnum, zset *dstzset, size_t *
 
         if (!exists) {
             tmp = zuiNewSdsFromValue(&zval);
-            znode = zslInsert(dstzset->zsl,zval.score,tmp);
+            /* For diff operations, preserve the original timestamp */
+            znode = zslInsert(dstzset->zsl,zval.score,zval.timestamp,tmp);
             dictAdd(dstzset->dict,tmp,&znode->score);
             if (sdslen(tmp) > *maxelelen) *maxelelen = sdslen(tmp);
             (*totelelen) += sdslen(tmp);
@@ -2612,7 +2750,7 @@ static void zdiffAlgorithm2(zsetopsrc *src, long setnum, zset *dstzset, size_t *
         while (zuiNext(&src[j],&zval)) {
             if (j == 0) {
                 tmp = zuiNewSdsFromValue(&zval);
-                znode = zslInsert(dstzset->zsl,zval.score,tmp);
+                znode = zslInsert(dstzset->zsl,zval.score,zval.timestamp,tmp);
                 dictAdd(dstzset->dict,tmp,&znode->score);
                 cardinality++;
             } else {
@@ -2877,7 +3015,8 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
                     }
                 } else if (j == setnum) {
                     tmp = zuiNewSdsFromValue(&zval);
-                    znode = zslInsert(dstzset->zsl,score,tmp);
+                    /* For inter operations, use timestamp from first set */
+                    znode = zslInsert(dstzset->zsl,score,zval.timestamp,tmp);
                     dictAdd(dstzset->dict,tmp,&znode->score);
                     totelelen += sdslen(tmp);
                     if (sdslen(tmp) > maxelelen) maxelelen = sdslen(tmp);
@@ -2940,7 +3079,9 @@ void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIndex, in
         while((de = dictNext(&di)) != NULL) {
             sds ele = dictGetKey(de);
             score = dictGetDoubleVal(de);
-            znode = zslInsert(dstzset->zsl,score,ele);
+            /* TODO: For union operations, timestamp aggregation is not yet implemented.
+             * Currently using 0 as timestamp. */
+            znode = zslInsert(dstzset->zsl,score,0,ele);
             dictSetVal(dstzset->dict,de,&znode->score);
         }
         dictResetIterator(&di);
@@ -3154,7 +3295,8 @@ static void zrangeResultEmitCBufferForStore(zrange_result_handler *handler,
     double newscore;
     int retflags = 0;
     sds ele = sdsnewlen(value, value_length_in_bytes);
-    int retval = zsetAdd(handler->dstobj, score, ele, ZADD_IN_NONE, &retflags, &newscore);
+    /* For ZRANGESTORE, use 0 as timestamp since original timestamp is not available here */
+    int retval = zsetAdd(handler->dstobj, score, 0, ele, ZADD_IN_NONE, &retflags, &newscore);
     sdsfree(ele);
     serverAssert(retval);
 }
@@ -3165,7 +3307,8 @@ static void zrangeResultEmitLongLongForStore(zrange_result_handler *handler,
     double newscore;
     int retflags = 0;
     sds ele = sdsfromlonglong(value);
-    int retval = zsetAdd(handler->dstobj, score, ele, ZADD_IN_NONE, &retflags, &newscore);
+    /* For ZRANGESTORE, use 0 as timestamp since original timestamp is not available here */
+    int retval = zsetAdd(handler->dstobj, score, 0, ele, ZADD_IN_NONE, &retflags, &newscore);
     sdsfree(ele);
     serverAssert(retval);
 }

@@ -4885,7 +4885,8 @@ int RM_ZsetAdd(RedisModuleKey *key, double score, RedisModuleString *ele, int *f
     if (server.memory_tracking_per_slot)
         oldsize = zsetAllocSize(key->kv);
     if (flagsptr) in_flags = moduleZsetAddFlagsToCoreFlags(*flagsptr);
-    if (zsetAdd(key->kv,score,ele->ptr,in_flags,&out_flags,NULL) == 0) {
+    /* Module API: use -1 timestamp to preserve existing or use 0 for new */
+    if (zsetAdd(key->kv,score,-1,ele->ptr,in_flags,&out_flags,NULL) == 0) {
         if (flagsptr) *flagsptr = 0;
         if (server.memory_tracking_per_slot)
             updateSlotAllocSize(key->db, getKeySlot(key->key->ptr), oldsize, zsetAllocSize(key->kv));
@@ -4923,7 +4924,8 @@ int RM_ZsetIncrby(RedisModuleKey *key, double score, RedisModuleString *ele, int
         oldsize = zsetAllocSize(key->kv);
     if (flagsptr) in_flags = moduleZsetAddFlagsToCoreFlags(*flagsptr);
     in_flags |= ZADD_IN_INCR;
-    if (zsetAdd(key->kv,score,ele->ptr,in_flags,&out_flags,newscore) == 0) {
+    /* Module API: use -1 timestamp to preserve existing or use 0 for new */
+    if (zsetAdd(key->kv,score,-1,ele->ptr,in_flags,&out_flags,newscore) == 0) {
         if (flagsptr) *flagsptr = 0;
         if (server.memory_tracking_per_slot)
             updateSlotAllocSize(key->db, getKeySlot(key->key->ptr), oldsize, zsetAllocSize(key->kv));
