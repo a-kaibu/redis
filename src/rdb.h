@@ -78,10 +78,12 @@
 #define RDB_TYPE_HASH_LISTPACK_EX_PRE_GA 23   /* Hash LP with HFEs. Doesn't attach min TTL at start (7.4 RC) */
 #define RDB_TYPE_HASH_METADATA 24             /* Hash with HFEs. Attach min TTL at start */
 #define RDB_TYPE_HASH_LISTPACK_EX 25          /* Hash LP with HFEs. Attach min TTL at start */
+#define RDB_TYPE_ZSET_3 26                    /* ZSET version 3 with timestamps stored. */
+#define RDB_TYPE_ZSET_LISTPACK_2 27           /* ZSET listpack version 2 with timestamps. */
 /* NOTE: WHEN ADDING NEW RDB TYPE, UPDATE rdbIsObjectType(), and rdb_type_string[] */
 
 /* Test if a type is an object type. */
-#define rdbIsObjectType(t) (((t) >= 0 && (t) <= 7) || ((t) >= 9 && (t) <= 25))
+#define rdbIsObjectType(t) (((t) >= 0 && (t) <= 7) || ((t) >= 9 && (t) <= 27))
 
 /* Special RDB opcodes (saved/loaded with rdbSaveType/rdbLoadType). */
 #define RDB_OPCODE_SLOT_INFO  244   /* Individual slot info, such as slot id and size (cluster mode only). */

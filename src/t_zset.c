@@ -1167,7 +1167,8 @@ unsigned char *zzlFind(unsigned char *lp, sds ele, double *score) {
     unsigned char *eptr, *sptr;
 
     if ((eptr = lpFirst(lp)) == NULL) return NULL;
-    eptr = lpFind(lp, eptr, (unsigned char*)ele, sdslen(ele), 1);
+    /* Skip 2 entries (score, timestamp) to reach next element */
+    eptr = lpFind(lp, eptr, (unsigned char*)ele, sdslen(ele), 2);
     if (eptr) {
         sptr = lpNext(lp,eptr);
         serverAssert(sptr != NULL);
@@ -1498,6 +1499,39 @@ int zsetScore(robj *zobj, sds member, double *score) {
         dictEntry *de = dictFind(zs->dict, member);
         if (de == NULL) return C_ERR;
         *score = *(double*)dictGetVal(de);
+    } else {
+        serverPanic("Unknown sorted set encoding");
+    }
+    return C_OK;
+}
+
+/* Get the timestamp of a member in a sorted set.
+ * Returns C_OK if the member exists and the timestamp is returned in *timestamp.
+ * Returns C_ERR if the member does not exist. */
+int zsetTimestamp(robj *zobj, sds member, long long *timestamp) {
+    if (!zobj || !member) return C_ERR;
+
+    if (zobj->encoding == OBJ_ENCODING_LISTPACK) {
+        unsigned char *zl = zobj->ptr;
+        unsigned char *eptr, *sptr;
+        double score;
+
+        eptr = zzlFind(zl, member, &score);
+        if (eptr == NULL) return C_ERR;
+
+        /* sptr points to the score, skip to timestamp */
+        sptr = lpNext(zl, eptr);
+        *timestamp = zzlGetTimestamp(zl, sptr);
+    } else if (zobj->encoding == OBJ_ENCODING_SKIPLIST) {
+        zset *zs = zobj->ptr;
+        dictEntry *de = dictFind(zs->dict, member);
+        if (de == NULL) return C_ERR;
+
+        /* Find the skiplist node to get the timestamp */
+        double score = *(double*)dictGetVal(de);
+        zskiplistNode *node = zslFind(zs->zsl, score, member);
+        if (node == NULL) return C_ERR;
+        *timestamp = node->timestamp;
     } else {
         serverPanic("Unknown sorted set encoding");
     }
@@ -1933,8 +1967,11 @@ void zaddGenericCommand(client *c, int flags) {
     sds ele;
     size_t oldsize = 0;
     double score = 0, *scores = NULL;
+    long long *timestamps = NULL;
     int j, elements, ch = 0;
     int scoreidx = 0;
+    int use_timestamp = 0; /* If TIMESTAMP option is specified globally */
+    long long global_timestamp = -1;
     /* The following vars are used in order to track what the command actually
      * did during the execution, to reply to the client and to trigger the
      * notification of keyspace change. */
@@ -1954,6 +1991,19 @@ void zaddGenericCommand(client *c, int flags) {
         else if (!strcasecmp(opt,"incr")) flags |= ZADD_IN_INCR;
         else if (!strcasecmp(opt,"gt")) flags |= ZADD_IN_GT;
         else if (!strcasecmp(opt,"lt")) flags |= ZADD_IN_LT;
+        else if (!strcasecmp(opt,"timestamp") && scoreidx+1 < c->argc) {
+            if (getLongLongFromObjectOrReply(c, c->argv[scoreidx+1], &global_timestamp,
+                "TIMESTAMP value is not an integer or out of range") != C_OK) {
+                return;
+            }
+            if (global_timestamp < 0) {
+                addReplyError(c, "TIMESTAMP must be non-negative");
+                return;
+            }
+            use_timestamp = 1;
+            scoreidx += 2;
+            continue;
+        }
         else break;
         scoreidx++;
     }
@@ -2027,9 +2077,9 @@ void zaddGenericCommand(client *c, int flags) {
         int retflags = 0;
 
         ele = c->argv[scoreidx+1+j*2]->ptr;
-        /* TODO: Parse TIMESTAMP option from command arguments.
-         * For now, use -1 to preserve existing timestamp or use 0 for new elements. */
-        int retval = zsetAdd(zobj, score, -1, ele, flags, &retflags, &newscore);
+        /* Use global_timestamp if TIMESTAMP option was specified, else -1 to preserve existing. */
+        long long ts = use_timestamp ? global_timestamp : -1;
+        int retval = zsetAdd(zobj, score, ts, ele, flags, &retflags, &newscore);
         if (retval == 0) {
             addReplyError(c,nanerr);
             if (server.memory_tracking_per_slot)
@@ -3213,6 +3263,7 @@ struct zrange_result_handler {
     robj                                *dstobj;
     void                                *userdata;
     int                                  withscores;
+    int                                  withtimestamps;
     int                                  should_emit_array_length;
     zrangeResultBeginFunction            beginResultEmission;
     zrangeResultFinalizeFunction         finalizeResultEmission;
@@ -4088,6 +4139,27 @@ void zmscoreCommand(client *c) {
         }
     }
     if (server.memory_tracking_per_slot && zobj != NULL)
+        updateSlotAllocSize(c->db, getKeySlot(key->ptr), oldsize, zsetAllocSize(zobj));
+}
+
+/* ZTIMESTAMP key member */
+void ztimestampCommand(client *c) {
+    robj *key = c->argv[1];
+    kvobj *zobj;
+    long long timestamp;
+    size_t oldsize = 0;
+
+    if ((zobj = lookupKeyReadOrReply(c,key,shared.null[c->resp])) == NULL ||
+        checkType(c,zobj,OBJ_ZSET)) return;
+
+    if (server.memory_tracking_per_slot)
+        oldsize = zsetAllocSize(zobj);
+    if (zsetTimestamp(zobj,c->argv[2]->ptr,&timestamp) == C_ERR) {
+        addReplyNull(c);
+    } else {
+        addReplyLongLong(c,timestamp);
+    }
+    if (server.memory_tracking_per_slot)
         updateSlotAllocSize(c->db, getKeySlot(key->ptr), oldsize, zsetAllocSize(zobj));
 }
 

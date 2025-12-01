@@ -703,9 +703,9 @@ int rdbSaveObjectType(rio *rdb, robj *o) {
             serverPanic("Unknown set encoding");
     case OBJ_ZSET:
         if (o->encoding == OBJ_ENCODING_LISTPACK)
-            return rdbSaveType(rdb,RDB_TYPE_ZSET_LISTPACK);
+            return rdbSaveType(rdb,RDB_TYPE_ZSET_LISTPACK_2);
         else if (o->encoding == OBJ_ENCODING_SKIPLIST)
-            return rdbSaveType(rdb,RDB_TYPE_ZSET_2);
+            return rdbSaveType(rdb,RDB_TYPE_ZSET_3);
         else
             serverPanic("Unknown sorted set encoding");
     case OBJ_HASH:
@@ -950,6 +950,10 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid) {
                 }
                 nwritten += n;
                 if ((n = rdbSaveBinaryDoubleValue(rdb,zn->score)) == -1)
+                    return -1;
+                nwritten += n;
+                /* Save timestamp for RDB_TYPE_ZSET_3 */
+                if ((n = rdbSaveLen(rdb,(uint64_t)zn->timestamp)) == -1)
                     return -1;
                 nwritten += n;
                 zn = zn->backward;
@@ -2106,7 +2110,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
                 sdsfree(sdsele);
             }
         }
-    } else if (rdbtype == RDB_TYPE_ZSET_2 || rdbtype == RDB_TYPE_ZSET) {
+    } else if (rdbtype == RDB_TYPE_ZSET_3 || rdbtype == RDB_TYPE_ZSET_2 || rdbtype == RDB_TYPE_ZSET) {
         /* Read sorted set value. */
         uint64_t zsetlen;
         size_t maxelelen = 0, totelelen = 0;
@@ -2128,6 +2132,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
         while(zsetlen--) {
             sds sdsele;
             double score;
+            long long timestamp = 0;
             zskiplistNode *znode;
 
             if ((sdsele = rdbGenericLoadStringObject(rdb,RDB_LOAD_SDS,NULL)) == NULL) {
@@ -2135,7 +2140,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
                 return NULL;
             }
 
-            if (rdbtype == RDB_TYPE_ZSET_2) {
+            if (rdbtype == RDB_TYPE_ZSET_3 || rdbtype == RDB_TYPE_ZSET_2) {
                 if (rdbLoadBinaryDoubleValue(rdb,&score) == -1) {
                     decrRefCount(o);
                     sdsfree(sdsele);
@@ -2149,6 +2154,17 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
                 }
             }
 
+            /* Load timestamp for RDB_TYPE_ZSET_3 */
+            if (rdbtype == RDB_TYPE_ZSET_3) {
+                uint64_t ts;
+                if ((ts = rdbLoadLen(rdb,NULL)) == RDB_LENERR) {
+                    decrRefCount(o);
+                    sdsfree(sdsele);
+                    return NULL;
+                }
+                timestamp = (long long)ts;
+            }
+
             if (isnan(score)) {
                 rdbReportCorruptRDB("Zset with NAN score detected");
                 decrRefCount(o);
@@ -2160,9 +2176,8 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
             if (sdslen(sdsele) > maxelelen) maxelelen = sdslen(sdsele);
             totelelen += sdslen(sdsele);
 
-            /* TODO: Load timestamp from RDB when new format is implemented.
-             * For backward compatibility with old RDB format, use 0 as default. */
-            znode = zslInsert(zs->zsl,score,0,sdsele);
+            /* Use loaded timestamp, or 0 for backward compatibility with old RDB format. */
+            znode = zslInsert(zs->zsl,score,timestamp,sdsele);
             if (dictAdd(zs->dict,sdsele,&znode->score) != DICT_OK) {
                 rdbReportCorruptRDB("Duplicate zset fields detected");
                 decrRefCount(o);
@@ -2558,6 +2573,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
                rdbtype == RDB_TYPE_SET_LISTPACK ||
                rdbtype == RDB_TYPE_ZSET_ZIPLIST ||
                rdbtype == RDB_TYPE_ZSET_LISTPACK ||
+               rdbtype == RDB_TYPE_ZSET_LISTPACK_2 ||
                rdbtype == RDB_TYPE_HASH_ZIPLIST ||
                rdbtype == RDB_TYPE_HASH_LISTPACK ||
                rdbtype == RDB_TYPE_HASH_LISTPACK_EX_PRE_GA ||
@@ -2740,6 +2756,26 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error)
                 if (deep_integrity_validation) server.stat_dump_payload_sanitizations++;
                 if (!lpValidateIntegrityAndDups(encoded, encoded_len, deep_integrity_validation, 2)) {
                     rdbReportCorruptRDB("Zset listpack integrity check failed.");
+                    zfree(encoded);
+                    o->ptr = NULL;
+                    decrRefCount(o);
+                    return NULL;
+                }
+                o->type = OBJ_ZSET;
+                o->encoding = OBJ_ENCODING_LISTPACK;
+                if (zsetLength(o) == 0) {
+                    decrRefCount(o);
+                    goto emptykey;
+                }
+
+                if (zsetLength(o) > server.zset_max_listpack_entries)
+                    zsetConvert(o, OBJ_ENCODING_SKIPLIST);
+                break;
+            case RDB_TYPE_ZSET_LISTPACK_2:
+                /* ZSET listpack with timestamps (3 entries per element) */
+                if (deep_integrity_validation) server.stat_dump_payload_sanitizations++;
+                if (!lpValidateIntegrityAndDups(encoded, encoded_len, deep_integrity_validation, 3)) {
+                    rdbReportCorruptRDB("Zset listpack_2 integrity check failed.");
                     zfree(encoded);
                     o->ptr = NULL;
                     decrRefCount(o);

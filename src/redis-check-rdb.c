@@ -86,6 +86,8 @@ char *rdb_type_string[] = {
     "hash-listpack-md-pre-release",
     "hash-hashtable-md",
     "hash-listpack-md",
+    "zset-v3",
+    "zset-listpack-v2",
 };
 
 /* Show a few stats collected into 'rdbstate' */
