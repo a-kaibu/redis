@@ -2,7 +2,7 @@
 
 Redis Sorted Setにタイムスタンプ機能を追加したフォーク版です。同じスコアを持つ要素間でタイムスタンプによるtie-breakが可能になります。  
 
-差分 <https://github.com/a-kaibu/redis/compare/8.4.0...main>  
+差分 <https://github.com/a-kaibu/redis/compare/2de1e4e348d82dbfc972ab5d8dc917be8e58d0d8...7657cefb42e99a52945ae8f990a65e5923e83f5b>  
 
 ## 機能概要
 
